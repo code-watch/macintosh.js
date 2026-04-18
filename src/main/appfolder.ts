@@ -40,7 +40,7 @@ export function moveToAppFolderMaybe() {
             }) === 1
           );
         }
-        return true;
+        return false;
       },
     });
   } else {

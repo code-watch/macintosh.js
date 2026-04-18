@@ -63,6 +63,7 @@ module.exports = {
       /\/src\/basilisk\/user_files(\/?)/,
       /\/patches(\/?)/,
       /\/@types(\/?)/,
+      /^\/\.env/,
       /package-lock\.json/,
       /yarn\.lock/,
       /README\.md/,

@@ -18,7 +18,7 @@ async function main() {
       "InternalName": package.name,
       "OriginalFilename": `${package.name}.exe`,
       "ProductName": package.productName,
-      "CompanyName": package.author
+      "CompanyName": typeof package.author === 'string' ? package.author : package.author.name
     }
   });
 }
