@@ -1,10 +1,11 @@
-const { app, dialog } = require("electron");
-const { getIsDevMode } = require("./devmode");
+import { app, dialog } from "electron";
+
+import { getIsDevMode } from "./devmode";
 
 // If the app doesn't run from the /Applications folder,
 // we don't get to create files, which keeps the emulator from
 // running.
-function moveToAppFolderMaybe() {
+export function moveToAppFolderMaybe() {
   if (process.platform !== "darwin") {
     return;
   }
@@ -39,13 +40,10 @@ function moveToAppFolderMaybe() {
             }) === 1
           );
         }
+        return false;
       },
     });
   } else {
     app.quit();
   }
 }
-
-module.exports = {
-  moveToAppFolderMaybe,
-};

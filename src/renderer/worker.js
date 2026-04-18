@@ -76,7 +76,7 @@ async function registerWorker() {
   };
 
   worker = window.emulatorWorker = new Worker(
-    "../basilisk/BasiliskII-worker-boot.js"
+    "../basilisk/BasiliskII-worker-boot.js",
   );
 
   // We'll need this info

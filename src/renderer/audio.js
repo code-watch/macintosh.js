@@ -47,7 +47,7 @@ gainNode.connect(audioContext.destination);
 function openAudio() {
   audio.pushAudio = function pushAudio(
     blockBuffer, // u8 typed array
-    sizeBytes // probably (frames per block=4096) * (bytes per sample=2) * (n channels=1)
+    sizeBytes, // probably (frames per block=4096) * (bytes per sample=2) * (n channels=1)
   ) {
     if (audio.paused) return;
 
@@ -61,7 +61,7 @@ function openAudio() {
     var soundBuffer = audioContext.createBuffer(
       audio.channels,
       sizeSamplesPerChannel,
-      audio.freq
+      audio.freq,
     );
     // source.connect(audioContext.destination);
     source.connect(gainNode);
@@ -69,7 +69,7 @@ function openAudio() {
     audio.fillWebAudioBufferFromChunk(
       blockBuffer,
       sizeSamplesPerChannel,
-      soundBuffer
+      soundBuffer,
     );
     // Workaround https://bugzilla.mozilla.org/show_bug.cgi?id=883675 by setting the buffer only after filling. The order is important here!
     source.buffer = soundBuffer;
@@ -123,7 +123,7 @@ function openAudio() {
 
     var blockBuffer = audioDataBufferView.slice(
       curChunkAddr + 2,
-      curChunkAddr + 2 + audio.bufferSize
+      curChunkAddr + 2 + audio.bufferSize,
     );
     audio.nextChunkIndex = audioDataBufferView[curChunkAddr + 1];
     audioDataBufferView[curChunkAddr] = LockStates.EMUL_THREAD_LOCK;
@@ -133,7 +133,7 @@ function openAudio() {
   audio.fillWebAudioBufferFromChunk = function fillWebAudioBufferFromChunk(
     blockBuffer, // u8 typed array
     blockSize, // probably 4096
-    dstAudioBuffer
+    dstAudioBuffer,
   ) {
     for (var c = 0; c < audio.channels; ++c) {
       var channelData = dstAudioBuffer.getChannelData(c);
@@ -198,7 +198,10 @@ function openAudio() {
       ++audio.numAudioTimersPending;
       audio.timer = setTimeout(
         audio.caller,
-        Math.max(0.0, 1000.0 * (secsUntilNextPlayStart - preemptBufferFeedSecs))
+        Math.max(
+          0.0,
+          1000.0 * (secsUntilNextPlayStart - preemptBufferFeedSecs),
+        ),
       );
 
       // If we are risking starving, immediately queue an extra buffer.
