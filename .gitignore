@@ -87,6 +87,11 @@ typings/
 
 # Electron-Forge
 out/
+dist/
+
+# Windows signing
+Microsoft.Trusted.Signing.Client*/
+trusted-signing-metadata.json
 
 # Custom stuff
 src/basilisk/user_files

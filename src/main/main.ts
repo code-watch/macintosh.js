@@ -1,11 +1,11 @@
-const { app, BrowserWindow } = require("electron");
+import { app, BrowserWindow } from "electron";
 
-const { registerIpcHandlers } = require("./ipc");
-const { createWindow } = require("./windows");
-const { getIsDevMode } = require("./devmode");
-const { shouldQuit } = require("./squirrel");
-const { setupUpdates } = require("./update");
-const { moveToAppFolderMaybe } = require("./appfolder");
+import { registerIpcHandlers } from "./ipc";
+import { createWindow } from "./windows";
+import { getIsDevMode } from "./devmode";
+import { shouldQuit } from "./squirrel";
+import { setupUpdates } from "./update";
+import { moveToAppFolderMaybe } from "./appfolder";
 
 async function onReady() {
   if (!getIsDevMode()) process.env.NODE_ENV = "production";
@@ -43,6 +43,11 @@ function main() {
     app.quit();
     return;
   }
+
+  // Newer Chromium gates SharedArrayBuffer on cross-origin isolation, which
+  // can't be satisfied from a file:// origin. The emulator needs SAB for the
+  // worker <-> renderer ring buffers, so enable it unconditionally.
+  app.commandLine.appendSwitch("enable-features", "SharedArrayBuffer");
 
   // Set the app's name
   app.setName("macintosh.js");

@@ -1,30 +1,35 @@
-const { ipcMain, app, BrowserWindow, dialog } = require("electron");
-const { setIsDevMode, getIsDevMode } = require("./devmode");
-const { getMainWindow } = require("./windows");
+import { ipcMain, app, BrowserWindow, dialog } from "electron";
 
-function registerIpcHandlers() {
+import { setIsDevMode, getIsDevMode } from "./devmode";
+import { getMainWindow } from "./windows";
+
+export function registerIpcHandlers() {
   ipcMain.handle("quit", () => app.quit());
 
   ipcMain.handle("devtools", () => {
     BrowserWindow.getAllWindows().forEach((w) =>
-      w.webContents.toggleDevTools()
+      w.webContents.toggleDevTools(),
     );
   });
 
   ipcMain.handle("getIsDevMode", () => getIsDevMode());
 
-  ipcMain.handle("setIsDevMode", (_event, set) => {
+  ipcMain.handle("setIsDevMode", (_event, set: boolean) => {
     setIsDevMode(set);
   });
 
   ipcMain.handle("showMessageBox", (_event, options) => {
     const mainWindow = getMainWindow();
-    return dialog.showMessageBox(mainWindow, options);
+    return mainWindow
+      ? dialog.showMessageBox(mainWindow, options)
+      : dialog.showMessageBox(options);
   });
 
   ipcMain.handle("showMessageBoxSync", (_event, options) => {
     const mainWindow = getMainWindow();
-    return dialog.showMessageBoxSync(mainWindow, options);
+    return mainWindow
+      ? dialog.showMessageBoxSync(mainWindow, options)
+      : dialog.showMessageBoxSync(options);
   });
 
   ipcMain.handle("getAppVersion", () => {
@@ -35,7 +40,3 @@ function registerIpcHandlers() {
     return app.getPath("userData");
   });
 }
-
-module.exports = {
-  registerIpcHandlers,
-};

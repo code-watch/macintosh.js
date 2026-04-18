@@ -10,9 +10,8 @@ async function credits() {
   };
 
   const version = await getAppVersion();
-  document.querySelector(
-    "#versions"
-  ).innerHTML = `macintosh.js v${version} with Electron v${process.versions.electron}`;
+  document.querySelector("#versions").innerHTML =
+    `macintosh.js v${version} with Electron v${process.versions.electron}`;
 }
 
 credits();
