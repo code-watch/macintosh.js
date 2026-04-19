@@ -1,18 +1,19 @@
-const { inputBuffer, INPUT_BUFFER_SIZE } = require("./input");
-const { videoModeBuffer, VIDEO_MODE_BUFFER_SIZE } = require("./video");
-const { setCanvasBlank } = require("./screen");
+const { ipcRenderer } = require("electron");
+const { inputBuffer, inputBufferView } = require("./input");
+const { videoModeBuffer } = require("./video");
 const {
   screenBuffer,
-  SCREEN_BUFFER_SIZE,
   SCREEN_WIDTH,
   SCREEN_HEIGHT,
+  setCanvasBlank,
 } = require("./screen");
+const { audioDataBuffer, audioBlockChunkSize } = require("./audio");
 const {
-  audio,
-  audioDataBuffer,
-  audioBlockChunkSize,
-  AUDIO_DATA_BUFFER_SIZE,
-} = require("./audio");
+  ethernetReceiveBuffer,
+  setupEthernet,
+  handleEthernetInit,
+  handleEthernetWrite,
+} = require("./ethernet");
 const { quit, getIsDevMode, getUserDataPath } = require("./ipc");
 
 let isWorkerRunning = false;
@@ -27,18 +28,14 @@ function getIsWorkerSaving() {
   return isWorkerSaving;
 }
 
-function saveDisk() {
+function saveExtfs() {
   isWorkerSaving = true;
   document.querySelector("#disk_saving").classList.remove("hidden");
-  worker.postMessage("disk_save");
+  worker.postMessage("save_extfs");
 }
 
-async function handleDiskSaved() {
-  console.log(`All files saved`);
-
+async function handleExtfsSaved() {
   isWorkerSaving = false;
-
-  // We're just gonna quit
   if (!(await getIsDevMode())) {
     quit();
   } else {
@@ -47,30 +44,23 @@ async function handleDiskSaved() {
 }
 
 async function handleWorkerShutdown() {
-  console.log(`Handling worker shutdown`);
-
   document.body.classList.remove("emulator_running");
-
-  // Then, update the canvas
   await setCanvasBlank();
-
-  saveDisk();
+  saveExtfs();
 }
 
 async function registerWorker() {
-  const workerConfig = {
-    inputBuffer: inputBuffer,
-    inputBufferSize: INPUT_BUFFER_SIZE,
-    screenBuffer: screenBuffer,
-    screenBufferSize: SCREEN_BUFFER_SIZE,
-    videoModeBuffer: videoModeBuffer,
-    videoModeBufferSize: VIDEO_MODE_BUFFER_SIZE,
-    audioDataBuffer: audioDataBuffer,
-    audioDataBufferSize: AUDIO_DATA_BUFFER_SIZE,
-    audioBlockBufferSize: audio.bufferSize,
-    audioBlockChunkSize: audioBlockChunkSize,
-    SCREEN_WIDTH: SCREEN_WIDTH,
-    SCREEN_HEIGHT: SCREEN_HEIGHT,
+  setupEthernet(inputBufferView);
+
+  const config = {
+    inputBuffer,
+    screenBuffer,
+    videoModeBuffer,
+    audioDataBuffer,
+    audioBlockChunkSize,
+    ethernetReceiveBuffer,
+    screenWidth: SCREEN_WIDTH,
+    screenHeight: SCREEN_HEIGHT,
     userDataPath: await getUserDataPath(),
     isDevMode: await getIsDevMode(),
   };
@@ -79,40 +69,53 @@ async function registerWorker() {
     "../basilisk/BasiliskII-worker-boot.js",
   );
 
-  // We'll need this info
   isWorkerRunning = true;
 
-  worker.postMessage(workerConfig);
+  worker.postMessage({ type: "start", config });
   worker.onmessage = function (e) {
-    if (e.data.type === "emulator_loading") {
-      const progressElement = document.querySelector("#progressbar");
-      const progressDialog = document.querySelector("#progress p");
-
-      if (progressElement && e.data.type === "emulator_loading") {
-        const val = Math.max(10, e.data.completion * 100);
-        console.log(`Loading progress: ${val}`);
-
-        progressElement.value = val;
-        progressElement.max = 100;
-      } else {
-        progressDialog.innerText = `Files loaded, now booting`;
+    const msg = e.data;
+    switch (msg?.type) {
+      case "emulator_loading": {
+        const progressElement = document.querySelector("#progressbar");
+        if (progressElement) {
+          progressElement.value = Math.max(10, msg.completion * 100);
+          progressElement.max = 100;
+        }
+        break;
       }
-    } else if (e.data.type === "TTY") {
-      // If we're shutting down, Basilisk II will send
-      // close_audio to TTY - our signal that we can
-      // save the disk image
-      if (e.data.data === "close_audio") {
-        handleWorkerShutdown();
-      }
-
-      // If we're ready, Basilisk II will send
-      // video_open()
-      if (e.data.data === "video_open()") {
+      case "emulator_video_open":
         document.body.classList.remove("emulator_loading");
         document.body.classList.add("emulator_running");
-      }
-    } else if (e.data.type === "disk_saved") {
-      handleDiskSaved();
+        break;
+      case "emulator_quit":
+        handleWorkerShutdown();
+        break;
+      case "extfs_saved":
+        handleExtfsSaved();
+        break;
+      case "emulator_ethernet_init":
+        handleEthernetInit(msg.macAddress);
+        break;
+      case "emulator_ethernet_write":
+        handleEthernetWrite(msg.destination, msg.packet);
+        break;
+      case "emulator_set_clipboard_text":
+        navigator.clipboard?.writeText(msg.text).catch(() => {});
+        break;
+      case "emulator_error":
+        console.error("Emulator error", msg.error);
+        ipcRenderer.invoke("showMessageBox", {
+          type: "error",
+          title: "Emulator error",
+          message: msg.error,
+        });
+        break;
+      case "showMessageBoxSync":
+        ipcRenderer.invoke("showMessageBoxSync", msg.options);
+        break;
+      case "TTY":
+        // Logged in the worker; nothing to do here.
+        break;
     }
   };
 }

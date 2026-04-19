@@ -1,108 +1,126 @@
 const { acquireLock, releaseLock } = require("./atomics");
+const {
+  InputBufferAddresses,
+  INPUT_BUFFER_SIZE,
+} = require("../basilisk/shared-buffers");
+const { JS_CODE_TO_ADB_KEYCODE } = require("../basilisk/key-codes");
+const { SCREEN_WIDTH, SCREEN_HEIGHT } = require("./screen");
 
-const INPUT_BUFFER_SIZE = 100;
 const inputBuffer = new SharedArrayBuffer(INPUT_BUFFER_SIZE * 4);
 const inputBufferView = new Int32Array(inputBuffer);
 
 let inputQueue = [];
-
-const InputBufferAddresses = {
-  globalLockAddr: 0,
-  mouseMoveFlagAddr: 1,
-  mouseMoveXDeltaAddr: 2,
-  mouseMoveYDeltaAddr: 3,
-  mouseButtonStateAddr: 4,
-  keyEventFlagAddr: 5,
-  keyCodeAddr: 6,
-  keyStateAddr: 7,
-};
 
 function releaseInputLock() {
   releaseLock(inputBufferView, InputBufferAddresses.globalLockAddr);
 }
 
 function tryToSendInput() {
+  if (!inputQueue.length) return;
   if (!acquireLock(inputBufferView, InputBufferAddresses.globalLockAddr)) {
     return;
   }
 
-  var hasMouseMove = false;
-  var mouseMoveX = 0;
-  var mouseMoveY = 0;
-  var mouseButtonState = -1;
-  var hasKeyEvent = false;
-  var keyCode = -1;
-  var keyState = -1;
+  let hasMousePosition = false;
+  let mousePositionX = 0;
+  let mousePositionY = 0;
+  let mouseButtonState = -1;
+  let mouseButton2State = -1;
+  let hasKeyEvent = false;
+  let keyCode = -1;
+  let keyState = -1;
+  const remaining = [];
 
-  // currently only one key event can be sent per sync
-  // TODO: better key handling code
-  var remainingKeyEvents = [];
-
-  for (var i = 0; i < inputQueue.length; i++) {
-    var inputEvent = inputQueue[i];
-    switch (inputEvent.type) {
+  for (const ev of inputQueue) {
+    switch (ev.type) {
       case "mousemove":
-        hasMouseMove = true;
-        // Make change according to https://github.com/felixrieseberg/macintosh.js/issues/6#issuecomment-665981700
-        mouseMoveX = inputEvent.dx;
-        mouseMoveY = inputEvent.dy;
+        hasMousePosition = true;
+        mousePositionX = ev.x;
+        mousePositionY = ev.y;
         break;
       case "mousedown":
       case "mouseup":
-        mouseButtonState = inputEvent.type === "mousedown" ? 1 : 0;
+        if (ev.button === 2) {
+          mouseButton2State = ev.type === "mousedown" ? 1 : 0;
+        } else {
+          mouseButtonState = ev.type === "mousedown" ? 1 : 0;
+        }
         break;
       case "keydown":
       case "keyup":
         if (hasKeyEvent) {
-          remainingKeyEvents.push(inputEvent);
+          remaining.push(ev);
           break;
         }
         hasKeyEvent = true;
-        keyState = inputEvent.type === "keydown" ? 1 : 0;
-        keyCode = inputEvent.keyCode;
+        keyState = ev.type === "keydown" ? 1 : 0;
+        keyCode = ev.keyCode;
         break;
     }
   }
-  if (hasMouseMove) {
-    inputBufferView[InputBufferAddresses.mouseMoveFlagAddr] = 1;
-    inputBufferView[InputBufferAddresses.mouseMoveXDeltaAddr] = mouseMoveX;
-    inputBufferView[InputBufferAddresses.mouseMoveYDeltaAddr] = mouseMoveY;
+
+  if (hasMousePosition) {
+    inputBufferView[InputBufferAddresses.mousePositionFlagAddr] = 1;
+    inputBufferView[InputBufferAddresses.mousePositionXAddr] = mousePositionX;
+    inputBufferView[InputBufferAddresses.mousePositionYAddr] = mousePositionY;
   }
   inputBufferView[InputBufferAddresses.mouseButtonStateAddr] = mouseButtonState;
+  inputBufferView[InputBufferAddresses.mouseButton2StateAddr] =
+    mouseButton2State;
   if (hasKeyEvent) {
     inputBufferView[InputBufferAddresses.keyEventFlagAddr] = 1;
     inputBufferView[InputBufferAddresses.keyCodeAddr] = keyCode;
     inputBufferView[InputBufferAddresses.keyStateAddr] = keyState;
   }
+
   releaseInputLock();
-  inputQueue = remainingKeyEvents;
+  inputQueue = remaining;
+}
+
+let canvasRect = canvas.getBoundingClientRect();
+window.addEventListener("resize", () => {
+  canvasRect = canvas.getBoundingClientRect();
+});
+
+function canvasToEmulator(event) {
+  return {
+    x: Math.round(
+      ((event.clientX - canvasRect.left) * SCREEN_WIDTH) / canvasRect.width,
+    ),
+    y: Math.round(
+      ((event.clientY - canvasRect.top) * SCREEN_HEIGHT) / canvasRect.height,
+    ),
+  };
 }
 
 canvas.addEventListener("mousemove", function (event) {
-  inputQueue.push({ type: "mousemove", dx: event.offsetX, dy: event.offsetY });
+  inputQueue.push({ type: "mousemove", ...canvasToEmulator(event) });
 });
 
 canvas.addEventListener("mousedown", function (event) {
-  inputQueue.push({ type: "mousedown" });
+  inputQueue.push({ type: "mousedown", button: event.button });
 });
 
 canvas.addEventListener("mouseup", function (event) {
-  inputQueue.push({ type: "mouseup" });
+  inputQueue.push({ type: "mouseup", button: event.button });
 });
 
 window.addEventListener("keydown", function (event) {
-  inputQueue.push({ type: "keydown", keyCode: event.keyCode });
+  const adb = JS_CODE_TO_ADB_KEYCODE[event.code];
+  if (adb === undefined) return;
+  event.preventDefault();
+  inputQueue.push({ type: "keydown", keyCode: adb });
 });
 
 window.addEventListener("keyup", function (event) {
-  inputQueue.push({ type: "keyup", keyCode: event.keyCode });
+  const adb = JS_CODE_TO_ADB_KEYCODE[event.code];
+  if (adb === undefined) return;
+  event.preventDefault();
+  inputQueue.push({ type: "keyup", keyCode: adb });
 });
 
 module.exports = {
-  INPUT_BUFFER_SIZE,
   inputBuffer,
   inputBufferView,
-  InputBufferAddresses,
-  inputQueue,
   tryToSendInput,
 };

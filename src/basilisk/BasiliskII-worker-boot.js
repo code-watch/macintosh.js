@@ -1,593 +1,537 @@
+// Emulator worker boot for the Infinite Mac WebAssembly build of Basilisk II.
+//
+// This file implements the `workerApi` global that the vendored
+// `BasiliskII.js`/`BasiliskII.wasm` calls back into for video, input, audio,
+// disk, clipboard and ethernet. The shape of that API and the shared-memory
+// buffer protocol are taken from Infinite Mac
+// (https://github.com/mihaip/infinite-mac, Copyright Mihai Parparita,
+// Apache License 2.0 — see LICENSE-infinite-mac). The implementation here is
+// macintosh.js-specific: it uses Node `fs` (available via
+// `nodeIntegrationInWorker`) for direct disk-image I/O and to populate the
+// extfs `macintosh.js` shared folder, instead of Infinite Mac's
+// chunked-HTTP / OPFS layers.
+
 const fs = require("fs");
 const path = require("path");
 
+const {
+  InputBufferAddresses,
+  LockStates,
+  ETHERNET_HEADER_INTS,
+  ETHERNET_BODY_SIZE,
+} = require("./shared-buffers");
+
 const homeDir = require("os").homedir();
 const macDir = path.join(homeDir, "macintosh.js");
-const macintoshCopyPath = path.join(__dirname, "user_files");
 
-// Set by config
 let userDataPath;
+let Module = null;
+
+// ---------------------------------------------------------------------------
+// Disk helpers (host ~/macintosh.js folder)
+// ---------------------------------------------------------------------------
+
+function isHiddenFile(name = "") {
+  return name.startsWith(".");
+}
+
+function isCDImage(name = "") {
+  const lower = name.toLowerCase();
+  return lower.endsWith(".iso") || lower.endsWith(".toast");
+}
+
+function isDiskImage(name = "") {
+  const lower = name.toLowerCase();
+  return (
+    lower.endsWith(".img") || lower.endsWith(".dsk") || lower.endsWith(".hda")
+  );
+}
 
 function getUserDataDiskPath() {
   return path.join(userDataPath, "disk");
 }
 
-// File type utilities
-
-function isFile(v = "") {
-  return fs.statSync(path.join(macDir, v)).isFile();
-}
-
-function isHiddenFile(filename = '') {
-  return filename.startsWith('.');
-}
-
-function isCDImage(filename = '') {
-  return filename.endsWith('.iso') || filename.endsWith('.toast');
-}
-
-function isDiskImage(filename = '') {
-  return filename.endsWith('.img') || filename.endsWith('.dsk') || filename.endsWith('.hda');
-}
-
-function cleanupCopyPath() {
-  try {
-    if (fs.existsSync(macintoshCopyPath)) {
-      fs.rmdirSync(macintoshCopyPath, { recursive: true });
-    }
-
-    fs.mkdirSync(macintoshCopyPath);
-  } catch (error) {
-    console.error(`cleanupCopyPath: Failed to remove`, error);
-  }
-}
-
-function getUserDataDiskImage() {
-  if (!userDataPath) {
-    console.error(`getUserDataDiskImage: userDataPath not set`);
-    return;
-  }
-
+function ensureUserDataDiskImage() {
   const diskImageUserPath = getUserDataDiskPath();
   const diskImagePath = path.join(__dirname, "disk");
 
-  // If there's a disk image, move it over
   if (!fs.existsSync(diskImageUserPath)) {
     try {
       fs.renameSync(diskImagePath, diskImageUserPath);
     } catch (error) {
-      // This is _probably_ a permissions thing, let's copy the file
       fs.copyFileSync(diskImagePath, diskImageUserPath);
     }
-  } else {
-    console.log(
-      `getUserDataDiskImage: Image in user data dir, not doing anything`
-    );
-  }
-}
-
-// Taken a given path, it'll look at all the files in there,
-// copy them over to the basilisk folder, and then add them
-// to MEMFS
-function preloadFilesAtPath(module, initalSourcePath) {
-  try {
-    const sourcePath = path.join(macDir, initalSourcePath);
-    const targetPath = `/macintosh.js${
-      initalSourcePath ? `/${initalSourcePath}` : ""
-    }`;
-    const files = fs.readdirSync(sourcePath).filter((v) => {
-      // Remove hidden, iso, and img files
-      return !isHiddenFile(v) && !isDiskImage(v) && !isCDImage(v);
-    });
-
-    (files || []).forEach((fileName) => {
-      try {
-        // If not, let's move on
-        const fileSourcePath = path.join(sourcePath, fileName);
-        const relativeSourcePath = `${
-          initalSourcePath ? `${initalSourcePath}/` : ""
-        }${fileName}`;
-
-        // Check if directory
-        if (fs.statSync(fileSourcePath).isDirectory()) {
-          try {
-            const virtualDirPath = `${targetPath}/${fileName}`;
-            module.FS.mkdir(virtualDirPath);
-          } catch (error) {
-            console.log(error);
-          }
-
-          preloadFilesAtPath(module, relativeSourcePath);
-          return;
-        }
-
-        createPreloadedFile(module, {
-          parent: targetPath,
-          name: fileName,
-          url: fileSourcePath,
-        });
-      } catch (error) {
-        postMessage("showMessageBoxSync", {
-          type: "error",
-          title: "Could not transfer file",
-          message: `We tried to transfer ${fileName} to the virtual machine, but failed. The error was: ${error}`,
-        });
-
-        console.error(
-          `preloadFilesAtPath: Failed to preload ${fileName}`,
-          error
-        );
-      }
-    });
-  } catch (error) {
-    postMessage("showMessageBoxSync", {
-      type: "error",
-      title: "Could not transfer files",
-      message: `We tried to transfer files to the virtual machine, but failed. The error was: ${error}`,
-    });
-
-    console.error(`preloadFilesAtPath: Failed to preloadFilesAtPath`, error);
-  }
-}
-
-function createPreloadedFile(module, options) {
-  const parent = options.parent || `/`;
-  const name = options.name || path.basename(options.url);
-  const url = options.url;
-
-  console.log(`Adding preload file`, { parent, name, url });
-  module.FS_createPreloadedFile(parent, name, url, true, true);
-}
-
-function addAutoloader(module) {
-  const loadDatafiles = function () {
-    module.autoloadFiles.forEach(({ url, name }) =>
-      createPreloadedFile(module, { url, name })
-    );
-
-    // If the user has a macintosh.js dir, we'll copy over user
-    // data
-    if (!fs.existsSync(macDir)) {
-      return;
-    }
-
-    // Load user files
-    preloadFilesAtPath(module, "");
-  };
-
-  if (module.autoloadFiles) {
-    module.preRun = module.preRun || [];
-    module.preRun.unshift(loadDatafiles);
-  }
-
-  return module;
-}
-
-function addCustomAsyncInit(module) {
-  if (module.asyncInit) {
-    module.preRun = module.preRun || [];
-    module.preRun.push(function waitForCustomAsyncInit() {
-      module.addRunDependency("__moduleAsyncInit");
-
-      module.asyncInit(module, function asyncInitCallback() {
-        module.removeRunDependency("__moduleAsyncInit");
-      });
-    });
-  }
-}
-
-function writeSafely(filePath, fileData) {
-  return new Promise((resolve) => {
-    fs.writeFile(filePath, fileData, (error) => {
-      if (error) {
-        postMessage("showMessageBoxSync", {
-          type: "error",
-          title: "Could not save files",
-          message: `We tried to save files from the virtual machine, but failed. The error was: ${error}`,
-        });
-
-        console.error(`Disk save: Encountered error for ${filePath}`, error);
-      } else {
-        console.log(`Disk save: Finished writing ${filePath}`);
-      }
-
-      resolve();
-    });
-  });
-}
-
-function writePrefs(userImages = []) {
-  try {
-    const prefsTemplatePath = path.join(__dirname, "prefs_template");
-    const prefsPath = path.join(userDataPath, "prefs");
-
-    let prefs = fs.readFileSync(prefsTemplatePath, { encoding: "utf-8" });
-
-    // Replace line endings, just in case
-    prefs = prefs.replaceAll("\r\n", "\n");
-
-    if (userImages && userImages.length > 0) {
-      console.log(`writePrefs: Found ${userImages.length} user images`);
-      userImages.forEach(({ name }) => {
-        if (isCDImage(name)) {
-          prefs += `\ncdrom ${name}`;
-        } else if (isDiskImage(name)) {
-          prefs += `\ndisk ${name}`;
-        }
-      });
-    }
-
-    prefs += `\n`;
-
-    fs.writeFileSync(prefsPath, prefs);
-  } catch (error) {
-    console.error(`writePrefs: Failed to set prefs`, error);
   }
 }
 
 function getUserImages() {
   const result = [];
-
   try {
-    // No need if the macDir doesn't exist
-    if (!fs.existsSync(macDir)) {
-      console.log(`getUserImages: ${macDir} does not exist, exit`);
-      return result;
-    }
-
+    if (!fs.existsSync(macDir)) return result;
     const macDirFiles = fs.readdirSync(macDir);
-    const imgFiles = macDirFiles.filter((v) => isFile(v) && isDiskImage(v));
-    const isoFiles = macDirFiles.filter((v) => isFile(v) && isCDImage(v));
-    const isoImgFiles = [...isoFiles, ...imgFiles];
-
-    console.log(`getUserImages: iso and img files`, isoImgFiles);
-
-    isoImgFiles.forEach((fileName, i) => {
-      const url = path.join(macDir, fileName);
-      const sanitizedFileName = `user_image_${i}_${fileName.replace(
-        /[^\w\s\.]/gi,
-        ""
-      )}`;
-
-      result.push({ url, name: sanitizedFileName });
-    });
+    let i = 0;
+    for (const fileName of macDirFiles) {
+      const full = path.join(macDir, fileName);
+      if (!fs.statSync(full).isFile()) continue;
+      if (!isDiskImage(fileName) && !isCDImage(fileName)) continue;
+      const safeName = `user_image_${i++}_${fileName.replace(/[^\w\s.]/gi, "")}`;
+      result.push({
+        name: safeName,
+        hostPath: full,
+        readOnly: isCDImage(fileName),
+      });
+    }
   } catch (error) {
-    console.error(`getUserImages: Encountered error`, error);
+    console.error(`getUserImages: error`, error);
   }
-
   return result;
 }
 
-function getAutoLoadFiles(userImages = []) {
-  const autoLoadFiles = [
-    {
-      name: "disk",
-      url: path.join(userDataPath, "disk"),
-    },
-    {
-      name: "rom",
-      url: path.join(__dirname, "rom"),
-    },
-    {
-      name: "prefs",
-      url: path.join(userDataPath, "prefs"),
-    },
-    ...userImages,
-  ];
+// ---------------------------------------------------------------------------
+// extfs: copy host ~/macintosh.js into MEMFS at boot, and back out on save
+// ---------------------------------------------------------------------------
 
-  return autoLoadFiles;
-}
-
-async function saveFilesInPath(folderPath) {
-  const entries = (Module.FS.readdir(folderPath) || []).filter(
-    (v) => !v.startsWith(".")
-  );
-
-  if (!entries || entries.length === 0) return;
-
-  // Ensure directory
-  const targetDir = path.join(homeDir, folderPath);
-  if (!fs.existsSync(targetDir)) {
-    fs.mkdirSync(targetDir);
+function preloadExtfsTree(FS, hostBase, virtualBase) {
+  let entries;
+  try {
+    entries = fs.readdirSync(hostBase);
+  } catch (error) {
+    console.error(`extfs preload: cannot read ${hostBase}`, error);
+    return;
   }
-
-  for (const file of entries) {
+  for (const name of entries) {
+    if (isHiddenFile(name) || isDiskImage(name) || isCDImage(name)) continue;
+    const hostPath = path.join(hostBase, name);
+    const virtualPath = `${virtualBase}/${name}`;
+    let stat;
     try {
-      const fileSourcePath = `${folderPath}/${file}`;
-      const stat = Module.FS.analyzePath(fileSourcePath);
-
-      if (stat && stat.object && stat.object.isFolder) {
-        // This is a folder, step into
-        await saveFilesInPath(fileSourcePath);
-      } else if (stat && stat.object && stat.object.contents) {
-        const fileData = stat.object.contents;
-        const filePath = path.join(targetDir, file);
-
-        await writeSafely(filePath, fileData);
-      } else {
-        console.log(
-          `Disk save: Object at ${fileSourcePath} is something, but we don't know what`,
-          stat
-        );
-      }
+      stat = fs.statSync(hostPath);
     } catch (error) {
-      postMessage("showMessageBoxSync", {
-        type: "error",
-        title: "Could not safe file",
-        message: `We tried to save the file "${file}" from the virtual machine, but failed. The error was: ${error}`,
-      });
-
-      console.error(`Disk save: Could not write ${file}`, error);
+      console.error(`extfs preload: cannot stat ${hostPath}`, error);
+      continue;
+    }
+    if (stat.isDirectory()) {
+      try {
+        FS.mkdir(virtualPath);
+      } catch (error) {
+        // already exists
+      }
+      preloadExtfsTree(FS, hostPath, virtualPath);
+    } else if (stat.isFile()) {
+      try {
+        const data = fs.readFileSync(hostPath);
+        FS.createDataFile(virtualBase, name, data, true, true, true);
+      } catch (error) {
+        postMessage({
+          type: "showMessageBoxSync",
+          options: {
+            type: "error",
+            title: "Could not transfer file",
+            message: `We tried to transfer ${name} to the virtual machine, but failed. The error was: ${error}`,
+          },
+        });
+      }
     }
   }
 }
 
-let InputBufferAddresses = {
-  globalLockAddr: 0,
-  mouseMoveFlagAddr: 1,
-  mouseMoveXDeltaAddr: 2,
-  mouseMoveYDeltaAddr: 3,
-  mouseButtonStateAddr: 4,
-  keyEventFlagAddr: 5,
-  keyCodeAddr: 6,
-  keyStateAddr: 7,
-};
+async function saveExtfsTree(FS, virtualBase, hostBase) {
+  let entries;
+  try {
+    entries = FS.readdir(virtualBase).filter((v) => !v.startsWith("."));
+  } catch (error) {
+    console.error(`extfs save: cannot read ${virtualBase}`, error);
+    return;
+  }
+  if (!fs.existsSync(hostBase)) {
+    fs.mkdirSync(hostBase, { recursive: true });
+  }
+  for (const name of entries) {
+    const virtualPath = `${virtualBase}/${name}`;
+    const hostPath = path.join(hostBase, name);
+    try {
+      const stat = FS.analyzePath(virtualPath);
+      if (stat?.object?.isFolder) {
+        await saveExtfsTree(FS, virtualPath, hostPath);
+      } else if (stat?.object?.contents) {
+        await fs.promises.writeFile(hostPath, stat.object.contents);
+      }
+    } catch (error) {
+      postMessage({
+        type: "showMessageBoxSync",
+        options: {
+          type: "error",
+          title: "Could not save file",
+          message: `We tried to save the file "${name}" from the virtual machine, but failed. The error was: ${error}`,
+        },
+      });
+    }
+  }
+}
 
-let LockStates = {
-  READY_FOR_UI_THREAD: 0,
-  UI_THREAD_LOCK: 1,
-  READY_FOR_EMUL_THREAD: 2,
-  EMUL_THREAD_LOCK: 3,
-};
+// ---------------------------------------------------------------------------
+// Disk API: direct host-file I/O (no MEMFS copy of the boot disk).
+// Mirrors the `workerApi.disks` interface that the WASM calls via EM_JS.
+// ---------------------------------------------------------------------------
 
-var Module = null;
+function createDisksApi(diskSpecs, getHeap) {
+  const byName = new Map(diskSpecs.map((d) => [d.name, d]));
+  const opened = new Map();
+  let nextId = 0;
+
+  return {
+    open(name) {
+      const spec = byName.get(name);
+      if (!spec) {
+        console.warn(`disks.open: unknown disk "${name}"`);
+        return -1;
+      }
+      try {
+        const flags = spec.readOnly ? "r" : "r+";
+        const fd = fs.openSync(spec.hostPath, flags);
+        const size = fs.fstatSync(fd).size;
+        const id = nextId++;
+        opened.set(id, { fd, size, readOnly: !!spec.readOnly });
+        return id;
+      } catch (error) {
+        console.error(`disks.open: failed for ${spec.hostPath}`, error);
+        return -1;
+      }
+    },
+    close(id) {
+      const entry = opened.get(id);
+      if (!entry) return;
+      try {
+        fs.closeSync(entry.fd);
+      } catch (error) {
+        // ignore
+      }
+      opened.delete(id);
+    },
+    read(id, bufPtr, offset, length) {
+      const entry = opened.get(id);
+      if (!entry) return -1;
+      try {
+        return fs.readSync(entry.fd, getHeap(), bufPtr, length, offset);
+      } catch (error) {
+        console.error(`disks.read failed`, error);
+        return -1;
+      }
+    },
+    write(id, bufPtr, offset, length) {
+      const entry = opened.get(id);
+      if (!entry || entry.readOnly) return -1;
+      try {
+        return fs.writeSync(entry.fd, getHeap(), bufPtr, length, offset);
+      } catch (error) {
+        console.error(`disks.write failed`, error);
+        return -1;
+      }
+    },
+    size(id) {
+      const entry = opened.get(id);
+      return entry ? entry.size : 0;
+    },
+    isMediaPresent() {
+      return true;
+    },
+    isFixedDisk() {
+      return true;
+    },
+    eject() {},
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Ethernet receive ring (worker side). The renderer pushes inbound frames
+// into the SharedArrayBuffer; the WASM polls etherRead() each input tick.
+// ---------------------------------------------------------------------------
+
+function createEthernetReader(receiveBuffer) {
+  if (!receiveBuffer) return () => 0;
+  const header = new Int32Array(receiveBuffer, 0, ETHERNET_HEADER_INTS);
+  const body = new Uint8Array(
+    receiveBuffer,
+    ETHERNET_HEADER_INTS * 4,
+    ETHERNET_BODY_SIZE,
+  );
+  const bodyLen = body.length;
+
+  return function read(dest) {
+    const writeIdx = Atomics.load(header, 0);
+    let readIdx = Atomics.load(header, 1);
+    if (readIdx === writeIdx) return 0;
+
+    const hi = body[readIdx];
+    const lo = body[(readIdx + 1) % bodyLen];
+    const len = (hi << 8) | lo;
+    readIdx = (readIdx + 2) % bodyLen;
+
+    if (len > dest.length) {
+      // Drop oversized frame but still advance.
+      readIdx = (readIdx + len) % bodyLen;
+      Atomics.store(header, 1, readIdx);
+      return 0;
+    }
+    for (let i = 0; i < len; i++) {
+      dest[i] = body[(readIdx + i) % bodyLen];
+    }
+    Atomics.store(header, 1, (readIdx + len) % bodyLen);
+    return len;
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Prefs
+// ---------------------------------------------------------------------------
+
+function buildPrefs(screenWidth, screenHeight, userImages) {
+  const template = fs.readFileSync(path.join(__dirname, "prefs_template"), {
+    encoding: "utf-8",
+  });
+  let prefs = template.replace(/\r\n/g, "\n");
+  prefs += `screen win/${screenWidth}/${screenHeight}\n`;
+  for (const img of userImages) {
+    prefs += `disk ${img.readOnly ? "*" : ""}${img.name}\n`;
+  }
+  return prefs;
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 
 self.onmessage = async function (msg) {
-  console.log("Worker message received", msg.data);
-
-  // If it's a config object, start the show
-  if (msg && msg.data && msg.data.SCREEN_WIDTH) {
-    console.log("Start emulator worker");
-    startEmulator(
-      Object.assign({}, msg.data, { singleThreadedEmscripten: true })
-    );
-  }
-
-  if (msg && msg.data === "disk_save") {
-    const diskData = Module.FS.readFile("/disk");
-    const diskPath = getUserDataDiskPath();
-
-    // I wish we could do this with promises, but OOM crashes kill that idea
-    try {
-      console.log(`Trying to save disk`);
-      fs.writeFileSync(diskPath, diskData);
-      console.log(`Finished writing disk`);
-    } catch (error) {
-      console.error(`Failed to write disk`, error);
+  if (msg?.data?.type === "start") {
+    startEmulator(msg.data.config);
+  } else if (msg?.data === "save_extfs") {
+    if (Module?.FS) {
+      await saveExtfsTree(Module.FS, "/macintosh.js", macDir);
     }
-
-    // Now, user files
-    console.log(`Saving user files`);
-    await saveFilesInPath("/macintosh.js");
-
-    // Clean up old copy dir
-    cleanupCopyPath();
-
-    postMessage({ type: "disk_saved" });
+    postMessage({ type: "extfs_saved" });
   }
 };
 
-function startEmulator(parentConfig) {
-  userDataPath = parentConfig.userDataPath;
+async function startEmulator(config) {
+  userDataPath = config.userDataPath;
+  ensureUserDataDiskImage();
 
-  getUserDataDiskImage();
+  const inputBufferView = new Int32Array(config.inputBuffer);
+  const screenBufferView = new Uint8Array(config.screenBuffer);
+  const videoModeBufferView = new Int32Array(config.videoModeBuffer);
+  const audioDataBufferView = new Uint8Array(config.audioDataBuffer);
+  const sleepBuffer = new Int32Array(new SharedArrayBuffer(4));
+  const ethernetRead = createEthernetReader(config.ethernetReceiveBuffer);
 
-  let screenBufferView = new Uint8Array(
-    parentConfig.screenBuffer,
-    0,
-    parentConfig.screenBufferSize
-  );
-
-  let videoModeBufferView = new Int32Array(
-    parentConfig.videoModeBuffer,
-    0,
-    parentConfig.videoModeBufferSize
-  );
-
-  let inputBufferView = new Int32Array(
-    parentConfig.inputBuffer,
-    0,
-    parentConfig.inputBufferSize
-  );
+  const userImages = getUserImages();
+  const diskSpecs = [
+    { name: "disk", hostPath: getUserDataDiskPath(), readOnly: false },
+    ...userImages,
+  ];
+  const prefs = buildPrefs(config.screenWidth, config.screenHeight, userImages);
+  const romData = fs.readFileSync(path.join(__dirname, "rom"));
+  const wasmBytes = fs.readFileSync(path.join(__dirname, "BasiliskII.wasm"));
 
   let nextAudioChunkIndex = 0;
-  let audioDataBufferView = new Uint8Array(
-    parentConfig.audioDataBuffer,
-    0,
-    parentConfig.audioDataBufferSize
-  );
+  let lastBlitFrameId = 0;
+  let lastIdleWaitFrameId = 0;
+  let nextExpectedBlitTime = 0;
 
-  function waitForTwoStateLock(bufferView, lockIndex) {
-    if (Atomics.load(bufferView, lockIndex) === LockStates.UI_THREAD_LOCK) {
-      while (
-        Atomics.compareExchange(
-          bufferView,
-          lockIndex,
-          LockStates.UI_THREAD_LOCK,
-          LockStates.EMUL_THREAD_LOCK
-        ) !== LockStates.UI_THREAD_LOCK
-      ) {
-        // spin
-        // TODO use wait and wake
-      }
-    } else {
-      // already unlocked
-    }
-  }
+  const workerApi = {
+    InputBufferAddresses,
 
-  function releaseTwoStateLock(bufferView, lockIndex) {
-    Atomics.store(bufferView, lockIndex, LockStates.UI_THREAD_LOCK); // unlock
-  }
-
-  function tryToAcquireCyclicalLock(bufferView, lockIndex) {
-    let res = Atomics.compareExchange(
-      bufferView,
-      lockIndex,
-      LockStates.READY_FOR_EMUL_THREAD,
-      LockStates.EMUL_THREAD_LOCK
-    );
-    if (res === LockStates.READY_FOR_EMUL_THREAD) {
-      return 1;
-    }
-    return 0;
-  }
-
-  function releaseCyclicalLock(bufferView, lockIndex) {
-    Atomics.store(bufferView, lockIndex, LockStates.READY_FOR_UI_THREAD); // unlock
-  }
-
-  function acquireInputLock() {
-    return tryToAcquireCyclicalLock(
-      inputBufferView,
-      InputBufferAddresses.globalLockAddr
-    );
-  }
-
-  function releaseInputLock() {
-    // reset
-    inputBufferView[InputBufferAddresses.mouseMoveFlagAddr] = 0;
-    inputBufferView[InputBufferAddresses.mouseMoveXDeltaAddr] = 0;
-    inputBufferView[InputBufferAddresses.mouseMoveYDeltaAddr] = 0;
-    inputBufferView[InputBufferAddresses.mouseButtonStateAddr] = 0;
-    inputBufferView[InputBufferAddresses.keyEventFlagAddr] = 0;
-    inputBufferView[InputBufferAddresses.keyCodeAddr] = 0;
-    inputBufferView[InputBufferAddresses.keyStateAddr] = 0;
-
-    releaseCyclicalLock(inputBufferView, InputBufferAddresses.globalLockAddr);
-  }
-
-  let AudioConfig = null;
-  let AudioBufferQueue = [];
-
-  // Check for user images
-  const userImages = getUserImages();
-
-  // Write prefs to user data dir
-  writePrefs(userImages);
-
-  // Assemble preload files
-  const autoloadFiles = getAutoLoadFiles(userImages);
-
-  // Set arguments
-  const arguments = ["--config", "prefs"];
-
-  Module = {
-    autoloadFiles,
-    userImages,
-    arguments,
-    canvas: null,
-
-    blit: function blit(bufPtr, width, height, depth, usingPalette) {
-      videoModeBufferView[0] = width;
-      videoModeBufferView[1] = height;
-      videoModeBufferView[2] = depth;
-      videoModeBufferView[3] = usingPalette;
-      let length = width * height * (depth === 32 ? 4 : 1); // 32bpp or 8bpp
-      for (let i = 0; i < length; i++) {
-        screenBufferView[i] = Module.HEAPU8[bufPtr + i];
-      }
-      // releaseTwoStateLock(videoModeBufferView, 9);
+    idleWait() {
+      if (lastIdleWaitFrameId === lastBlitFrameId) return false;
+      lastIdleWaitFrameId = lastBlitFrameId;
+      const timeout = Math.max(0, nextExpectedBlitTime - performance.now());
+      const result = Atomics.wait(
+        inputBufferView,
+        InputBufferAddresses.globalLockAddr,
+        LockStates.READY_FOR_UI_THREAD,
+        timeout,
+      );
+      return result === "ok";
     },
 
-    openAudio: function openAudio(
-      sampleRate,
-      sampleSize,
-      channels,
-      framesPerBuffer
-    ) {
-      AudioConfig = {
-        sampleRate: sampleRate,
-        sampleSize: sampleSize,
-        channels: channels,
-        framesPerBuffer: framesPerBuffer,
-      };
-      console.log(AudioConfig);
+    sleep(timeSeconds) {
+      Atomics.wait(sleepBuffer, 0, 0, timeSeconds * 1000);
     },
 
-    enqueueAudio: function enqueueAudio(bufPtr, nbytes, type) {
-      let newAudio = Module.HEAPU8.slice(bufPtr, bufPtr + nbytes);
-      let writingChunkIndex = nextAudioChunkIndex;
-      let writingChunkAddr =
-        writingChunkIndex * parentConfig.audioBlockChunkSize;
+    didOpenVideo(width, height) {
+      postMessage({ type: "emulator_video_open", width, height });
+    },
 
+    blit(bufPtr, bufSize) {
+      lastBlitFrameId++;
+      if (bufPtr) {
+        const data = Module.HEAPU8.subarray(bufPtr, bufPtr + bufSize);
+        videoModeBufferView[0] = bufSize;
+        screenBufferView.set(data);
+      }
+      nextExpectedBlitTime = performance.now() + 16;
+    },
+
+    didOpenAudio(sampleRate, sampleSize, channels) {
+      postMessage({
+        type: "emulator_audio_open",
+        sampleRate,
+        sampleSize,
+        channels,
+      });
+    },
+
+    audioBufferSize() {
+      return 0;
+    },
+
+    enqueueAudio(bufPtr, nbytes) {
+      const chunkCapacity = config.audioBlockChunkSize - 2;
+      if (nbytes > chunkCapacity) nbytes = chunkCapacity;
+      const newAudio = Module.HEAPU8.subarray(bufPtr, bufPtr + nbytes);
+      const writingChunkAddr = nextAudioChunkIndex * config.audioBlockChunkSize;
       if (audioDataBufferView[writingChunkAddr] === LockStates.UI_THREAD_LOCK) {
-        console.warn(
-          "worker tried to write audio data to UI-thread-locked chunk",
-          writingChunkIndex
-        );
-        return 0;
+        return;
       }
-
-      let nextNextChunkIndex = writingChunkIndex + 1;
+      let nextNext = nextAudioChunkIndex + 1;
       if (
-        nextNextChunkIndex * parentConfig.audioBlockChunkSize >
+        nextNext * config.audioBlockChunkSize >
         audioDataBufferView.length - 1
       ) {
-        nextNextChunkIndex = 0;
+        nextNext = 0;
       }
-
-      audioDataBufferView[writingChunkAddr + 1] = nextNextChunkIndex;
+      audioDataBufferView[writingChunkAddr + 1] = nextNext;
       audioDataBufferView.set(newAudio, writingChunkAddr + 2);
       audioDataBufferView[writingChunkAddr] = LockStates.UI_THREAD_LOCK;
-
-      nextAudioChunkIndex = nextNextChunkIndex;
-      return nbytes;
+      nextAudioChunkIndex = nextNext;
     },
 
-    debugPointer: function debugPointer(ptr) {
-      console.log("debugPointer", ptr);
+    acquireInputLock() {
+      const res = Atomics.compareExchange(
+        inputBufferView,
+        InputBufferAddresses.globalLockAddr,
+        LockStates.READY_FOR_EMUL_THREAD,
+        LockStates.EMUL_THREAD_LOCK,
+      );
+      return res === LockStates.READY_FOR_EMUL_THREAD ? 1 : 0;
     },
 
-    acquireInputLock: acquireInputLock,
+    releaseInputLock() {
+      inputBufferView[InputBufferAddresses.mousePositionFlagAddr] = 0;
+      inputBufferView[InputBufferAddresses.mousePositionXAddr] = 0;
+      inputBufferView[InputBufferAddresses.mousePositionYAddr] = 0;
+      inputBufferView[InputBufferAddresses.mouseButtonStateAddr] = 0;
+      inputBufferView[InputBufferAddresses.mouseButton2StateAddr] = 0;
+      inputBufferView[InputBufferAddresses.keyEventFlagAddr] = 0;
+      inputBufferView[InputBufferAddresses.keyCodeAddr] = 0;
+      inputBufferView[InputBufferAddresses.keyStateAddr] = 0;
+      inputBufferView[InputBufferAddresses.ethernetInterruptFlagAddr] = 0;
+      Atomics.store(
+        inputBufferView,
+        InputBufferAddresses.globalLockAddr,
+        LockStates.READY_FOR_UI_THREAD,
+      );
+    },
 
-    InputBufferAddresses: InputBufferAddresses,
-
-    getInputValue: function getInputValue(addr) {
+    getInputValue(addr) {
       return inputBufferView[addr];
     },
 
-    totalDependencies: 0,
-    monitorRunDependencies: function (left) {
-      this.totalDependencies = Math.max(this.totalDependencies, left);
-
-      if (left == 0) {
-        postMessage({ type: "emulator_ready" });
-      } else {
-        postMessage({
-          type: "emulator_loading",
-          completion: (this.totalDependencies - left) / this.totalDependencies,
-        });
-      }
+    etherSeed() {
+      return Math.floor(Math.random() * 0xffffffff);
     },
 
-    print: (message) => {
-      console.log(message);
-
-      postMessage({
-        type: "TTY",
-        data: message,
-      });
+    etherInit(macAddress) {
+      postMessage({ type: "emulator_ethernet_init", macAddress });
     },
 
-    printErr: console.warn.bind(console),
+    etherWrite(destination, packetPtr, packetLength) {
+      const packet = Module.HEAPU8.slice(packetPtr, packetPtr + packetLength);
+      postMessage(
+        { type: "emulator_ethernet_write", destination, packet },
+        [packet.buffer],
+      );
+    },
 
-    releaseInputLock: releaseInputLock,
+    etherRead(packetPtr, packetMaxLength) {
+      const dest = Module.HEAPU8.subarray(
+        packetPtr,
+        packetPtr + packetMaxLength,
+      );
+      return ethernetRead(dest);
+    },
+
+    setClipboardText(text) {
+      postMessage({ type: "emulator_set_clipboard_text", text });
+    },
+
+    getClipboardText() {
+      return undefined;
+    },
+
+    disks: createDisksApi(diskSpecs, () => Module.HEAPU8),
   };
 
-  addAutoloader(Module);
-  addCustomAsyncInit(Module);
+  globalThis.workerApi = workerApi;
 
-  if (parentConfig.singleThreadedEmscripten) {
-    importScripts("BasiliskII.js");
+  const moduleOverrides = {
+    arguments: ["--config", "prefs"],
+
+    instantiateWasm(imports, successCallback) {
+      WebAssembly.instantiate(wasmBytes, imports)
+        .then((output) => successCallback(output.instance))
+        .catch((error) => {
+          console.error("WASM instantiate failed", error);
+          postMessage({
+            type: "emulator_error",
+            error: String(error?.stack || error),
+          });
+        });
+      return {};
+    },
+
+    preRun: [
+      function () {
+        const FS = moduleOverrides.FS;
+        FS.createDataFile("/", "prefs", prefs, true, true, true);
+        FS.createDataFile("/", "rom", romData, true, true, true);
+        FS.mkdir("/macintosh.js");
+        if (fs.existsSync(macDir)) {
+          preloadExtfsTree(FS, macDir, "/macintosh.js");
+        }
+        postMessage({ type: "emulator_loading", completion: 1 });
+      },
+    ],
+
+    onRuntimeInitialized() {
+      postMessage({ type: "emulator_ready" });
+    },
+
+    print(message) {
+      console.log(message);
+      postMessage({ type: "TTY", data: message });
+    },
+
+    printErr(message) {
+      console.warn(message);
+      postMessage({ type: "TTY", data: message });
+    },
+
+    quit(status) {
+      console.log("Emulator quit with status", status);
+      postMessage({ type: "emulator_quit", status });
+    },
+  };
+
+  Module = moduleOverrides;
+
+  try {
+    const { default: emulator } = await import("./BasiliskII.js");
+    emulator(moduleOverrides);
+  } catch (error) {
+    console.error("Failed to start emulator", error);
+    postMessage({
+      type: "emulator_error",
+      error: String(error?.stack || error),
+    });
   }
 }

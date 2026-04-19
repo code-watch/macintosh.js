@@ -115,7 +115,9 @@ Yes, you can. Click on the "Help" button at the bottom of the running app to see
 
 ## Can I connect to the Internet?
 
-No. For what it's worth, the web was quite different 30 years ago - and you wouldn't be able to open even Google. However, Internet Explorer and Netscape are installed, as is the "Web Sharing Server", if you want to play around a bit.
+Partially. The emulator now exposes a virtual Ethernet card (thanks to [Infinite Mac](https://infinitemac.org)'s `ether js` driver). Out of the box, frames are bridged to UDP port 6066 — the same "udptunnel" scheme native Basilisk II / SheepShaver use — so two copies of macintosh.js on the same LAN can talk AppleTalk to each other, share files via the Chooser, and so on.
+
+Reaching the modern Internet additionally needs a userspace TCP/IP NAT (a `slirp`-style gateway) plugged into `src/main/ethernet.ts`. That isn't bundled yet; even with it, the 1997-era browsers on the disk image won't get far against today's TLS. Internet Explorer, Netscape, and the "Web Sharing Server" are still installed if you want to play around.
 
 ## Should I use this for [serious application]?
 
