@@ -2,8 +2,11 @@ import { ipcMain, app, BrowserWindow, dialog } from "electron";
 
 import { setIsDevMode, getIsDevMode } from "./devmode";
 import { getMainWindow } from "./windows";
+import { registerEthernetHandlers } from "./ethernet";
 
 export function registerIpcHandlers() {
+  registerEthernetHandlers();
+
   ipcMain.handle("quit", () => app.quit());
 
   ipcMain.handle("devtools", () => {
